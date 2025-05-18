@@ -102,7 +102,7 @@ export function ChatInterface() {
       
       setMessages((prev) => [...prev, assistantMessage]);
       
-      // Update search results if available
+      // Only show search results when has_complete_details is true
       if (data.has_complete_details && data.search_queries.length > 0) {
         setSearchResults(data.search_queries);
         setShowResults(true);
@@ -114,6 +114,10 @@ export function ChatInterface() {
         };
         
         setMessages((prev) => [...prev, searchResultsMessage]);
+      } else if (data.search_queries.length > 0) {
+        // Save search queries but don't display yet
+        setSearchResults(data.search_queries); 
+        setShowResults(false);
       } else {
         setShowResults(false);
       }
