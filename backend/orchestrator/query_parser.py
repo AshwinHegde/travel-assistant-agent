@@ -16,6 +16,8 @@ from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+# Import the query generator at the bottom to avoid circular imports
+
 # Load environment variables from .env file
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path, override=True)
@@ -25,16 +27,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 class TravelQueryDetails(BaseModel):
     """Extracted travel details from user query"""
     origin: Optional[str] = Field(None, description="Origin city or airport code")
-    destination: str = Field(..., description="Destination city or airport code")
+    destination: List[str] = Field(default_factory=list, description="Destination city or airport code(s)")
     budget: Optional[float] = Field(None, description="Total budget for the trip")
     trip_length_days: Optional[int] = Field(None, description="Length of the trip in days")
     earliest_start_date: Optional[date] = Field(None, description="Earliest possible start date")
     latest_start_date: Optional[date] = Field(None, description="Latest possible start date")
     specific_month: Optional[str] = Field(None, description="If user specified a month (e.g., 'June')")
-    travelers: int = Field(1, description="Number of travelers")
     flexible_dates: bool = Field(False, description="Whether dates are flexible")
-    preferred_airlines: List[str] = Field(default_factory=list, description="Preferred airlines if specified")
-    max_stops: Optional[int] = Field(None, description="Maximum number of stops")
 
 
 class FlightSearchQuery(BaseModel):
@@ -44,9 +43,6 @@ class FlightSearchQuery(BaseModel):
     depart_date: date = Field(..., description="Departure date")
     return_date: date = Field(..., description="Return date")
     budget: Optional[float] = Field(None, description="Budget constraint")
-    travelers: int = Field(1, description="Number of travelers")
-    max_stops: Optional[int] = Field(None, description="Maximum number of stops")
-    preferred_airlines: List[str] = Field(default_factory=list, description="Preferred airlines")
 
 
 class QueryParsingResult(BaseModel):
@@ -67,116 +63,56 @@ query_parser = Agent(
     You are a travel query parser. Your task is to extract detailed travel information from 
     user queries and generate specific flight search parameters.
     
+    CRITICAL INFORMATION REQUIREMENTS:
+    - Origin city or airport (ALWAYS required unless explicitly provided by user)
+    - Specific destination (city, not just country or state - e.g., "San Francisco" not just "California")
+    - Trip length or duration
+    - Date information (REQUIRED - can be specific dates, a month, multiple months, or date range)
+    
+    IMPORTANT ABOUT DATES:
+    - Some form of date information is ALWAYS required - do not make date assumptions
+    - This can be specific dates (e.g., "June 10-15"), a month ("June"), multiple months ("June or July"), or a season ("summer")
+    - If the user says "flexible" about dates, you must still know the general timeframe (which month or months)
+    - If no date information is provided, ALWAYS mark this as missing information
+    
+    NON-CRITICAL INFORMATION (helpful but not required immediately):
+    - Budget
+    - Preferences for activities or accommodations
+    
     For date ranges:
-    - If a specific month is mentioned (e.g., "June"), generate date options throughout that month
-    - If trip length is specified (e.g., "3-day trip"), ensure return dates match that duration
-    - Default to searching dates 2-3 months from the current date if no specific dates
+    - If a specific month is mentioned (e.g., 'June'), generate date options throughout that month
+    - If trip length is specified (e.g., '3-day trip'), ensure return dates match that duration
+    - For "weekend", assume 2-3 day trip over a weekend (Friday-Sunday)
     
     For locations:
-    - Default origin is the user's current location if not specified
-    - Extract destination cities, regions, or countries
+    - Always mark origin as missing unless clearly specified by the user
+    - For destinations, always require specific cities/locations, not just regions/countries
+    - For example, if user says "California", mark "Specific location within California" as missing
     
     For budget:
-    - Extract total budget amounts if specified
-    - Default to medium price range if not specified
+    - Extract total budget amounts if specified but don't prioritize asking for it
+    - This is non-critical information that can be provided later
+    
+    If the user says they are flexible on dates or destination, or says 'any' or 'no preference,' treat that as complete information for that field and do not ask for further clarification.
     
     When generating search queries, create a reasonable set of specific date combinations
-    that satisfy the constraints. For example, if "June" is mentioned for a "3-day trip",
+    that satisfy the constraints. For example, if 'June' is mentioned for a '3-day trip',
     generate all options like Jun 1-4, Jun 8-11, Jun 15-18, etc.
     
-    Include all relevant details and highlight any missing information that would be needed
-    for a complete search.
+    In your final response, the missing_info field MUST include ALL critical information that is missing.
+    Double-check your missing_info list before finalizing your response.
     """
 )
 
 
-def generate_date_options(details: TravelQueryDetails) -> List[tuple[date, date]]:
-    """Generate date options based on the extracted travel details"""
-    today = date.today()
-    date_pairs = []
+async def create_flight_search_queries(details: TravelQueryDetails) -> List[FlightSearchQuery]:
+    """Create flight search queries from travel details using the LLM-powered query generator"""
+    # Import the query generator here to avoid circular imports
+    from orchestrator.query_generator import create_travel_search_queries
     
-    # If specific month mentioned, generate options throughout that month
-    if details.specific_month:
-        try:
-            # Convert month name to month number
-            month_num = datetime.strptime(details.specific_month, "%B").month
-            
-            # If month is in the past for this year, assume next year
-            year = today.year
-            if month_num < today.month:
-                year += 1
-                
-            # Define start and end constraints
-            month_start = date(year, month_num, 1)
-            
-            # Get days in month
-            if month_num == 12:
-                next_month = date(year + 1, 1, 1)
-            else:
-                next_month = date(year, month_num + 1, 1)
-            month_end = next_month - timedelta(days=1)
-            
-            # Generate date pairs based on trip length
-            trip_length = details.trip_length_days or 3  # Default to 3 days if not specified
-            
-            # Generate a reasonable number of options (not too many)
-            step = 5 if trip_length <= 3 else 3  # Shorter trips can have more options
-            
-            current_start = month_start
-            while current_start <= month_end - timedelta(days=trip_length):
-                current_end = current_start + timedelta(days=trip_length)
-                if current_end <= month_end:
-                    date_pairs.append((current_start, current_end))
-                current_start += timedelta(days=step)
-        except ValueError:
-            # Fallback if month parsing fails
-            pass
-    
-    # If explicit date range specified
-    elif details.earliest_start_date and details.trip_length_days:
-        latest_start = details.latest_start_date or (details.earliest_start_date + timedelta(days=14))
-        trip_length = details.trip_length_days
-        
-        current_start = details.earliest_start_date
-        while current_start <= latest_start:
-            date_pairs.append((current_start, current_start + timedelta(days=trip_length)))
-            current_start += timedelta(days=3)  # Skip forward by 3 days each time
-    
-    # Fallback to near future dates
-    else:
-        trip_length = details.trip_length_days or 3
-        future_start = today + timedelta(days=30)  # Start 1 month from now
-        
-        for i in range(0, 30, 7):  # Generate options over several weeks
-            start_date = future_start + timedelta(days=i)
-            end_date = start_date + timedelta(days=trip_length)
-            date_pairs.append((start_date, end_date))
-    
-    return date_pairs
-
-
-def create_flight_search_queries(details: TravelQueryDetails) -> List[FlightSearchQuery]:
-    """Create flight search queries from travel details"""
-    date_pairs = generate_date_options(details)
-    
-    # Default to "SEA" as origin if not specified (just as an example)
-    origin = details.origin or "SEA"
-    
-    search_queries = []
-    for depart_date, return_date in date_pairs:
-        query = FlightSearchQuery(
-            origin=origin,
-            destination=details.destination,
-            depart_date=depart_date,
-            return_date=return_date,
-            budget=details.budget,
-            travelers=details.travelers,
-            max_stops=details.max_stops,
-            preferred_airlines=details.preferred_airlines,
-        )
-        search_queries.append(query)
-    
-    return search_queries
+    # Call the LLM-powered query generator
+    result = await create_travel_search_queries(details)
+    return result["flight_queries"]
 
 
 async def parse_travel_query(query_text: str) -> QueryParsingResult:
@@ -196,9 +132,16 @@ async def parse_travel_query(query_text: str) -> QueryParsingResult:
 
 def parse_travel_query_sync(query_text: str) -> QueryParsingResult:
     """Synchronous version of parse_travel_query for use in non-async contexts"""
-    # Use Pydantic AI agent to parse the query
-    result = query_parser.run_sync(query_text)
-    return result.output
+    import asyncio
+    
+    # Use an existing event loop if available, otherwise create one
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    return loop.run_until_complete(parse_travel_query(query_text))
 
 
 if __name__ == "__main__":

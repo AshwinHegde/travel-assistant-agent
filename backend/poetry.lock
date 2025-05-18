@@ -964,6 +964,21 @@ files = [
 ]
 
 [[package]]
+name = "holidays"
+version = "0.35"
+description = "Generate and work with holidays in Python"
+optional = false
+python-versions = ">=3.8"
+groups = ["main"]
+files = [
+    {file = "holidays-0.35-py3-none-any.whl", hash = "sha256:3e179ff248f86dee813160c92e2c4babe3bb3c732287499430d1e3ee90c15f16"},
+    {file = "holidays-0.35.tar.gz", hash = "sha256:e62b797ca3ba2366093458cda0cde33d65e7168be8104815b4149afd4ea4a9ed"},
+]
+
+[package.dependencies]
+python-dateutil = "*"
+
+[[package]]
 name = "httpcore"
 version = "1.0.9"
 description = "A minimal low-level HTTP client."
@@ -3149,4 +3164,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.10"
-content-hash = "55c764299c981067b4420afb4a3a60238dbf4a6c6526ab226b9ab18a6dcbbc0e"
+content-hash = "e20ed5b5673b7592aa403e3dea573a124e14c2f84f099702ea35d837f517bea0"

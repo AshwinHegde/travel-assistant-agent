@@ -17,6 +17,7 @@ playwright = "^1.40.0"
 httpx = "^0.27.0"
 tomli = "^2.0.0"
 agentops = {version = "^0.4.12", extras = ["observability"], python = ">=3.10,<3.14"}
+holidays = "^0.35"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.0.0"

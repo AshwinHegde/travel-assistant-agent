@@ -15,25 +15,28 @@ from datetime import datetime, date
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from agentops.sdk.decorators import operation, agent
+import logging
 
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-# Import query parser components
-# Use absolute import path instead of relative import
+# Import query parser components (using absolute imports)
 from orchestrator.query_parser import (
     TravelQueryDetails,
     FlightSearchQuery,
     parse_travel_query,
-    create_flight_search_queries,
-    generate_date_options
+    create_flight_search_queries
 )
 
 # Load environment variables
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path, override=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Add logger setup at the top
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("travel_chat")
 
 # Models for the chat functionality
 class ConversationState(BaseModel):
@@ -72,21 +75,50 @@ class TravelChatAgent:
             You are a friendly travel assistant who helps users plan trips. Your goal is to collect all the information 
             needed to search for travel options while keeping the conversation natural and engaging.
             
-            When information is missing:
-            - Ask for ALL missing essential details in a single conversational message
-            - Frame your questions in a natural, friendly way that flows like a normal conversation
-            - Group related questions together (like dates and duration)
-            - Use what you already know about the user's preferences to personalize questions
-            - Offer reasonable suggestions or options when appropriate
-            - Be empathetic and understanding
+            CRITICAL information you MUST collect (in order of priority):
+            1. ORIGIN - Where the user is traveling from (always ask this first if not provided)
+            2. SPECIFIC DESTINATION - Exact city or location, not just country or state
+               (e.g., ask for "San Francisco" not just "California")
+            3. TRIP LENGTH - How many days they want to stay
+            4. DATES - REQUIRED - When they want to travel (must be one of these):
+               - Specific dates (e.g., "June 10-15")
+               - A month (e.g., "June")
+               - Multiple months or range (e.g., "June-July" or "summer")
+               - If they say "flexible," still ask which month(s) they're considering
             
-            For example, instead of a checklist of questions, say something like:
-            "That sounds like a fun trip to New York! To help you find the best options, could you tell me when you're 
-            planning to travel and how long you'd like to stay? Also, are you traveling from your home in Seattle, and 
-            do you have a budget in mind for this trip?"
+            IMPORTANT: Do not make any date assumptions. Always ask explicitly for when they want to travel.
+            If user mentions "weekend" without specifying when, ask which weekend or month they're considering.
+            
+            NON-CRITICAL information (only ask after critical info is collected):
+            - Budget preferences
+            - Activity interests
+            
+            QUESTION FORMAT:
+            When asking for missing information, ALWAYS format your questions as a numbered list, like:
+            
+            1. Where will you be traveling from?
+            2. Which specific city in California would you like to visit?
+            3. How many days are you planning to stay?
+            4. Which month(s) are you considering for your trip?
+            
+            When information is missing:
+            - ALWAYS check for and ask about ALL critical missing information at once
+            - ALWAYS start with asking about origin if it's missing
+            - If both origin and specific destination are missing, ask for both together
+            - Date information is required - if missing, always ask for month(s) or timeframe
+            - Do not move on to non-critical information until ALL critical info is provided
+            - Always use numbered lists for questions
+            
+            For example:
+            "A weekend getaway in California sounds wonderful! To help you find the best options, I need some more information:
+            
+            1. Where will you be traveling from?
+            2. Which specific city in California would you like to visit (like San Francisco, Los Angeles, or San Diego)?
+            3. How many days are you planning to stay?
+            4. Which month or months are you considering for this trip?"
             
             Always maintain a friendly, helpful tone and keep responses concise while collecting all necessary information.
-            Once you have all the required information, let the user know you're ready to search for options.
+            Once you have all the critical information, let the user know you're searching based on what you know.
             """
         )
     
@@ -162,131 +194,46 @@ async def get_conversation_context(ctx: RunContext[ConversationState]) -> str:
 async def identify_missing_information(ctx: RunContext[ConversationState]) -> str:
     """
     Check what information is still missing from the travel query.
-    This uses the missing_info list that was originally populated by the query parser.
+    Distinguishes between critical and non-critical missing information.
     """
     state = ctx.deps
     
     if not state.travel_details:
         return "No travel details extracted yet."
     
-    # The missing_info list should already be populated from the query parser
-    # or updated when fields are changed
+    # Categorize missing information
+    critical_missing = []
+    nice_to_have_missing = []
     
-    if state.missing_info:
-        return f"Still missing: {', '.join(state.missing_info)}"
-    else:
-        return "All essential information has been collected."
-
-
-@travel_chat_agent.tool
-@operation
-async def update_travel_details(
-    ctx: RunContext[ConversationState], 
-    field: str, 
-    value: str
-) -> str:
-    """
-    Update the travel details based on user response using the query parser.
-    This leverages the existing parsing logic instead of duplicating it.
-    """
-    state = ctx.deps
-    
-    # Initialize travel details if not already done
-    if not state.travel_details:
-        state.travel_details = TravelQueryDetails(destination="")
-    
-    # Construct a query that focuses on the specific field
-    field_queries = {
-        "destination": f"I want to go to {value}",
-        "origin": f"I want to travel from {value}",
-        "trip_length_days": f"I want to travel for {value} days",
-        "specific_month": f"I want to travel in {value}",
-        "travel_dates": f"I want to travel on {value}",
-        "budget": f"My budget is {value}",
-        "travelers": f"There will be {value} travelers"
-    }
-    
-    query = field_queries.get(field, f"My {field} is {value}")
-    
-    try:
-        # Parse the field-specific query
-        parse_result = await parse_travel_query(query)
-        
-        # Update only the specific field from the parse result, keep other fields as is
-        updated = False
-        
-        if field == "destination" and parse_result.details.destination:
-            state.travel_details.destination = parse_result.details.destination
-            updated = True
-        
-        elif field == "origin" and parse_result.details.origin:
-            state.travel_details.origin = parse_result.details.origin
-            updated = True
-        
-        elif field == "trip_length_days" and parse_result.details.trip_length_days:
-            state.travel_details.trip_length_days = parse_result.details.trip_length_days
-            updated = True
-        
-        elif field == "specific_month" and parse_result.details.specific_month:
-            state.travel_details.specific_month = parse_result.details.specific_month
-            updated = True
-        
-        elif field == "travel_dates":
-            # Handle both month and specific dates
-            if parse_result.details.specific_month:
-                state.travel_details.specific_month = parse_result.details.specific_month
-                updated = True
-            if parse_result.details.earliest_start_date:
-                state.travel_details.earliest_start_date = parse_result.details.earliest_start_date
-                updated = True
-            if parse_result.details.latest_start_date:
-                state.travel_details.latest_start_date = parse_result.details.latest_start_date
-                updated = True
-        
-        elif field == "budget" and parse_result.details.budget:
-            state.travel_details.budget = parse_result.details.budget
-            updated = True
-        
-        elif field == "travelers" and parse_result.details.travelers > 0:
-            state.travel_details.travelers = parse_result.details.travelers
-            updated = True
-        
-        # If parsing via the query parser didn't work, fall back to direct assignment for simple fields
-        if not updated:
-            if field == "destination":
-                state.travel_details.destination = value
-            elif field == "origin":
-                state.travel_details.origin = value
-            elif field == "specific_month":
-                # Simple cleanup for month names
-                months = ["january", "february", "march", "april", "may", "june", 
-                          "july", "august", "september", "october", "november", "december"]
-                cleaned_value = value.lower().strip()
-                for month in months:
-                    if month.startswith(cleaned_value) or month[:3] == cleaned_value.lower():
-                        state.travel_details.specific_month = month.capitalize()
-                        break
-            # Add fallbacks for other fields as needed
-    
-    except Exception as e:
-        print(f"Error using query parser for update: {str(e)}")
-        # Fall back to basic parsing if query parser fails
+    for field in state.missing_info:
+        # Critical fields: destination, some form of dates, trip length
         if field == "destination":
-            state.travel_details.destination = value
-        elif field == "origin":
-            state.travel_details.origin = value
-        # Add other basic field assignments here
+            critical_missing.append(field)
+        elif field == "travel_dates" and not (state.travel_details.specific_month or state.travel_details.earliest_start_date):
+            critical_missing.append(field)
+        elif field == "trip_length_days":
+            critical_missing.append(field)
+        else:
+            # Non-critical fields: origin (can default), specific dates (can use month), budget, etc.
+            nice_to_have_missing.append(field)
     
-    # Update the state
-    state.last_updated_field = field
+    result = ""
+    if critical_missing:
+        result += f"Critical missing information: {', '.join(critical_missing)}\n"
     
-    # Check if this field was in missing_info and remove it
-    if field in state.missing_info:
-        state.missing_info.remove(field)
-    elif field == "travel_dates" and "travel_dates" in state.missing_info:
-        state.missing_info.remove("travel_dates")
+    if nice_to_have_missing:
+        result += f"Additional helpful information: {', '.join(nice_to_have_missing)}\n"
     
-    return f"Updated {field} to {value}"
+    if not critical_missing and not nice_to_have_missing:
+        result = "All essential information has been collected."
+    
+    # Add a note about proceeding with search
+    if critical_missing:
+        result += "Need this information before proceeding with search."
+    elif nice_to_have_missing:
+        result += "Can proceed with search, but more details would improve results."
+    
+    return result
 
 
 @travel_chat_agent.tool
@@ -312,7 +259,7 @@ async def generate_search_queries(ctx: RunContext[ConversationState]) -> str:
             state.travel_details.origin = "current location"  # Default placeholder
         
         # Generate the queries
-        state.search_queries = create_flight_search_queries(state.travel_details)
+        state.search_queries = await create_flight_search_queries(state.travel_details)
         state.queries_generated = True
         
         if state.search_queries:
@@ -349,113 +296,37 @@ async def process_message(user_message: str, session_id: Optional[str] = None) -
         session_id = session_id or str(uuid.uuid4())
         state = ConversationState(session_id=session_id)
     
-    # If this is a new conversation, try to parse initial travel intent
+    # Build full chat context for the parser
+    chat_context = ""
+    if state.conversation_history:
+        for msg in state.conversation_history:
+            chat_context += f"{msg['role'].capitalize()}: {msg['content']}\n"
+    chat_context += f"User: {user_message}\n"
+
+    # Use chat_context instead of just user_message for parsing
     if not state.travel_details:
         try:
-            # Record the original query
             state.original_query = user_message
-            
-            # Parse the query
-            parse_result = await parse_travel_query(user_message)
-            
-            # Use the details and missing_info directly from the parser
+            parse_result = await parse_travel_query(chat_context)
             state.travel_details = parse_result.details
             state.missing_info = parse_result.missing_info
-            
-            # If we already have enough details, generate search queries
-            if not parse_result.missing_info:
+            if not state.missing_info:
                 state.search_queries = parse_result.search_queries
                 state.queries_generated = True
         except Exception as e:
-            # If parsing fails, just initialize with an empty travel details object
             state.travel_details = TravelQueryDetails(destination="")
-            # Set standard missing fields
             state.missing_info = ["destination", "trip_length_days", "travel_dates", "origin", "budget"]
             print(f"Error parsing initial query: {str(e)}")
     else:
-        # This is a follow-up message, try to extract multiple pieces of information
         try:
-            # Always run the query parser on follow-up messages to extract any information
-            parse_result = await parse_travel_query(user_message)
-            
-            # Update any fields that were extracted by the parser
-            updated_fields = []
-            
-            # Check and update destination
-            if parse_result.details.destination and (
-                not state.travel_details.destination or 
-                parse_result.details.destination != state.travel_details.destination
-            ):
-                state.travel_details.destination = parse_result.details.destination
-                if "destination" in state.missing_info:
-                    state.missing_info.remove("destination")
-                updated_fields.append("destination")
-            
-            # Check and update origin
-            if parse_result.details.origin and (
-                not state.travel_details.origin or 
-                parse_result.details.origin != state.travel_details.origin
-            ):
-                state.travel_details.origin = parse_result.details.origin
-                if "origin" in state.missing_info:
-                    state.missing_info.remove("origin")
-                updated_fields.append("origin")
-            
-            # Check and update trip length
-            if parse_result.details.trip_length_days and (
-                not state.travel_details.trip_length_days or 
-                parse_result.details.trip_length_days != state.travel_details.trip_length_days
-            ):
-                state.travel_details.trip_length_days = parse_result.details.trip_length_days
-                if "trip_length_days" in state.missing_info:
-                    state.missing_info.remove("trip_length_days")
-                updated_fields.append("trip length")
-            
-            # Check and update month/dates
-            date_fields_updated = False
-            
-            if parse_result.details.specific_month and (
-                not state.travel_details.specific_month or 
-                parse_result.details.specific_month != state.travel_details.specific_month
-            ):
-                state.travel_details.specific_month = parse_result.details.specific_month
-                date_fields_updated = True
-                updated_fields.append("month")
-            
-            if parse_result.details.earliest_start_date and (
-                not state.travel_details.earliest_start_date or 
-                parse_result.details.earliest_start_date != state.travel_details.earliest_start_date
-            ):
-                state.travel_details.earliest_start_date = parse_result.details.earliest_start_date
-                date_fields_updated = True
-                updated_fields.append("start date")
-            
-            if date_fields_updated and "travel_dates" in state.missing_info:
-                state.missing_info.remove("travel_dates")
-            
-            # Check and update budget
-            if parse_result.details.budget and (
-                not state.travel_details.budget or 
-                parse_result.details.budget != state.travel_details.budget
-            ):
-                state.travel_details.budget = parse_result.details.budget
-                if "budget" in state.missing_info:
-                    state.missing_info.remove("budget")
-                updated_fields.append("budget")
-            
-            # Check and update travelers
-            if parse_result.details.travelers > 1 and (
-                state.travel_details.travelers == 1 or 
-                parse_result.details.travelers != state.travel_details.travelers
-            ):
-                state.travel_details.travelers = parse_result.details.travelers
-                if "travelers" in state.missing_info:
-                    state.missing_info.remove("travelers")
-                updated_fields.append("number of travelers")
-            
-            if updated_fields:
-                print(f"Updated fields from follow-up message: {', '.join(updated_fields)}")
-        
+            parse_result = await parse_travel_query(chat_context)
+            # Always trust the parser's missing_info and details
+            state.travel_details = parse_result.details
+            state.missing_info = parse_result.missing_info
+            # Only update queries if all info is present
+            if not state.missing_info:
+                state.search_queries = parse_result.search_queries
+                state.queries_generated = True
         except Exception as e:
             print(f"Error extracting information from follow-up message: {str(e)}")
             # If parsing fails, we'll rely on the chat agent to handle it
@@ -469,8 +340,47 @@ async def process_message(user_message: str, session_id: Optional[str] = None) -
         "timestamp": datetime.now().isoformat()
     })
     
-    # Process the message with the chat agent
-    result = await travel_chat_agent.run(user_message, deps=state)
+    # Create context string based on current state
+    context_prefix = ""
+    if state.travel_details:
+        # Build a summary of what we know
+        details = []
+        if state.travel_details.origin:
+            details.append(f"Origin: {state.travel_details.origin}")
+        if state.travel_details.destination:
+            details.append(f"Destination: {', '.join(state.travel_details.destination)}")
+        if state.travel_details.trip_length_days:
+            details.append(f"Trip length: {state.travel_details.trip_length_days} days")
+        if state.travel_details.specific_month:
+            details.append(f"Month: {state.travel_details.specific_month}")
+        if state.travel_details.earliest_start_date:
+            details.append(f"Earliest start date: {state.travel_details.earliest_start_date}")
+        if state.travel_details.budget:
+            details.append(f"Budget: ${state.travel_details.budget}")
+        
+        # Add state information to context
+        context_prefix = "SYSTEM: "
+        if details:
+            context_prefix += f"Current travel details: {', '.join(details)}. "
+        
+        if state.missing_info:
+            context_prefix += f"CRITICAL MISSING INFORMATION: {', '.join(state.missing_info)}. "
+            
+            # Emphasize origin if it's missing
+            if "Origin city or airport" in state.missing_info or any("origin" in item.lower() for item in state.missing_info):
+                context_prefix += "ORIGIN IS MISSING - YOU MUST ASK FOR ORIGIN FIRST. "
+            
+            context_prefix += "You MUST ask for ALL this missing information before proceeding. "
+            context_prefix += "FORMAT YOUR QUESTIONS AS A NUMBERED LIST."
+        else:
+            context_prefix += "All necessary information has been collected. DO NOT ask for any more travel details. "
+            context_prefix += "Instead, confirm the trip details and proceed with the search."
+        
+        context_prefix += "\n\n"
+    
+    # Process the message with the chat agent, including the context prefix
+    logger.info(f"Sending to chat agent with context: {context_prefix}")
+    result = await travel_chat_agent.run(context_prefix + user_message, deps=state)
     
     # Update conversation history with assistant's response
     state.conversation_history.append({
@@ -479,28 +389,35 @@ async def process_message(user_message: str, session_id: Optional[str] = None) -
         "timestamp": datetime.now().isoformat()
     })
     
-    # If we have all the information, try to generate search queries
-    if not state.missing_info and not state.queries_generated:
+    # Simplified logic: Only use parser's missing_info to determine if we can proceed
+    should_generate_queries = not state.missing_info and not state.queries_generated
+    
+    # If we have all the information and haven't generated queries yet, do so
+    if should_generate_queries:
         try:
-            # Create the search queries
-            state.search_queries = create_flight_search_queries(state.travel_details)
+            logger.info(f"All information collected (missing_info is empty). Generating search queries.")
+            state.search_queries = await create_flight_search_queries(state.travel_details)
             state.queries_generated = True
+            logger.info(f"Generated {len(state.search_queries)} search queries.")
         except Exception as e:
-            print(f"Error generating search queries: {str(e)}")
+            logger.error(f"Error generating search queries: {str(e)}")
     
     # Save the updated state
     SESSION_STORAGE[state.session_id] = state
     
     # Create the response
+    has_complete_details = not state.missing_info and state.queries_generated
+    logger.info(f"Preparing response: has_complete_details={has_complete_details}, missing_info={state.missing_info}, queries_generated={state.queries_generated}")
+
     response = ChatResponse(
         message=result.output,
         missing_info=state.missing_info,
-        has_complete_details=not state.missing_info and state.queries_generated,
+        has_complete_details=has_complete_details,
         session_id=state.session_id
     )
-    
-    # Add search queries if they've been generated
-    if state.queries_generated and state.search_queries:
+
+    # Only add search queries if has_complete_details is true
+    if has_complete_details and state.search_queries:
         response.search_queries = [
             {
                 "origin": q.origin,
@@ -512,7 +429,11 @@ async def process_message(user_message: str, session_id: Optional[str] = None) -
             }
             for q in state.search_queries[:5]  # Limit to first 5 queries for brevity
         ]
-    
+        logger.info(f"Attaching {len(response.search_queries)} search queries to response.")
+    else:
+        response.search_queries = []
+        logger.info("Not attaching search queries to response (conversation not complete).")
+
     return response
 
 
@@ -532,4 +453,4 @@ if __name__ == "__main__":
             print(f"Assistant: {follow_up.message}")
             print(f"Missing info: {follow_up.missing_info}")
     
-    asyncio.run(test_chat()) 
+    asyncio.run(test_chat())
