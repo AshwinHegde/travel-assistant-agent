@@ -20,7 +20,8 @@ from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 # Import query parser components
-from .query_parser import (
+# Use absolute import path instead of relative import
+from orchestrator.query_parser import (
     TravelQueryDetails,
     FlightSearchQuery,
     parse_travel_query,
@@ -68,16 +69,20 @@ travel_chat_agent = Agent(
     needed to search for travel options while keeping the conversation natural and engaging.
     
     When information is missing:
-    - Ask ONE question at a time in a conversational way
-    - Focus on the most important missing detail first
-    - Use what you already know about the user's preferences
-    - Offer reasonable suggestions when appropriate
+    - Ask for ALL missing essential details in a single conversational message
+    - Frame your questions in a natural, friendly way that flows like a normal conversation
+    - Group related questions together (like dates and duration)
+    - Use what you already know about the user's preferences to personalize questions
+    - Offer reasonable suggestions or options when appropriate
     - Be empathetic and understanding
     
-    For example, instead of "Please provide your destination", say something like 
-    "That sounds like a fun trip! Where were you thinking of traveling to?"
+    For example, instead of a checklist of questions, say something like:
+    "That sounds like a fun trip to New York! To help you find the best options, could you tell me when you're 
+    planning to travel and how long you'd like to stay? Also, are you traveling from your home in San Francisco, and 
+    do you have a budget in mind for this trip?"
     
-    Always maintain a friendly, helpful tone and keep responses concise.
+    Always maintain a friendly, helpful tone and keep responses concise while collecting all necessary information.
+    Once you have all the required information, let the user know you're ready to search for options.
     """
 )
 
@@ -115,10 +120,28 @@ async def get_conversation_context(ctx: RunContext[ConversationState]) -> str:
         context = "No specific travel details have been collected yet."
     
     if state.missing_info:
-        context += f"\n\nMissing information: {', '.join(state.missing_info)}"
+        # Group missing information by category for better context
+        missing_categories = {
+            "location": ["origin", "destination"],
+            "timing": ["trip_length_days", "travel_dates", "specific_month"],
+            "preferences": ["budget", "travelers"]
+        }
+        
+        grouped_missing = {}
+        for category, fields in missing_categories.items():
+            missing_in_category = [field for field in fields if field in state.missing_info]
+            if missing_in_category:
+                grouped_missing[category] = missing_in_category
+        
+        context += "\n\nMissing information by category:"
+        for category, fields in grouped_missing.items():
+            context += f"\n- {category.capitalize()}: {', '.join(fields)}"
     
     if state.last_updated_field:
         context += f"\n\nLast updated field: {state.last_updated_field}"
+    
+    # Add hints for multi-field responses
+    context += "\n\nHINT: You should ask for ALL missing essential information at once in a natural, conversational way."
     
     return context
 
@@ -150,7 +173,8 @@ async def update_travel_details(
     value: str
 ) -> str:
     """
-    Update the travel details based on user response.
+    Update the travel details based on user response using the query parser.
+    This leverages the existing parsing logic instead of duplicating it.
     """
     state = ctx.deps
     
@@ -158,116 +182,87 @@ async def update_travel_details(
     if not state.travel_details:
         state.travel_details = TravelQueryDetails(destination="")
     
-    # Update the appropriate field based on user input
-    if field == "destination":
-        state.travel_details.destination = value
+    # Construct a query that focuses on the specific field
+    field_queries = {
+        "destination": f"I want to go to {value}",
+        "origin": f"I want to travel from {value}",
+        "trip_length_days": f"I want to travel for {value} days",
+        "specific_month": f"I want to travel in {value}",
+        "travel_dates": f"I want to travel on {value}",
+        "budget": f"My budget is {value}",
+        "travelers": f"There will be {value} travelers"
+    }
     
-    elif field == "origin":
-        state.travel_details.origin = value
+    query = field_queries.get(field, f"My {field} is {value}")
     
-    elif field == "trip_length_days":
-        try:
-            # Handle conversational responses
-            value = value.lower()
-            if "week" in value:
-                days = 7
-                if "one" in value or "1" in value:
-                    days = 7
-                elif "two" in value or "2" in value:
-                    days = 14
-                state.travel_details.trip_length_days = days
-            else:
-                # Try to extract a number
-                import re
-                number_match = re.search(r'\d+', value)
-                if number_match:
-                    days = int(number_match.group())
-                    state.travel_details.trip_length_days = days
-                else:
-                    return f"Could not determine the trip length from '{value}'."
-        except:
-            return f"Could not parse '{value}' as a trip length."
-    
-    elif field == "specific_month":
-        # Clean up month name and standardize it
-        months = ["january", "february", "march", "april", "may", "june", 
-                  "july", "august", "september", "october", "november", "december"]
+    try:
+        # Parse the field-specific query
+        parse_result = await parse_travel_query(query)
         
-        cleaned_value = value.lower().strip()
-        # Handle abbreviations
-        for i, month in enumerate(months):
-            if month.startswith(cleaned_value) or month[:3] == cleaned_value.lower():
-                cleaned_value = month
-                break
+        # Update only the specific field from the parse result, keep other fields as is
+        updated = False
         
-        # Set month if it's valid
-        if cleaned_value in months:
-            state.travel_details.specific_month = cleaned_value.capitalize()
-        else:
-            return f"'{value}' doesn't seem to be a valid month."
-    
-    elif field == "travel_dates":
-        # Try to parse as a month name first
-        months = ["january", "february", "march", "april", "may", "june", 
-                  "july", "august", "september", "october", "november", "december"]
+        if field == "destination" and parse_result.details.destination:
+            state.travel_details.destination = parse_result.details.destination
+            updated = True
         
-        value_lower = value.lower()
-        for month in months:
-            if month in value_lower or month[:3] in value_lower:
-                state.travel_details.specific_month = month.capitalize()
-                return f"Set travel month to {month.capitalize()}"
+        elif field == "origin" and parse_result.details.origin:
+            state.travel_details.origin = parse_result.details.origin
+            updated = True
         
-        # Otherwise try to extract date ranges
-        try:
-            import re
-            # This is a simplistic approach - would need more robust parsing in production
-            if "to" in value or "-" in value:
-                parts = re.split(r'\s+to\s+|-', value)
-                if len(parts) == 2:
-                    # Very basic parsing - would need proper date parsing in a real app
-                    return f"Detected date range in '{value}', but would need more specific formatting."
-            
-            return f"Could not parse '{value}' as travel dates. Please specify a month or date range."
-        except:
-            return f"Could not parse '{value}' as travel dates."
+        elif field == "trip_length_days" and parse_result.details.trip_length_days:
+            state.travel_details.trip_length_days = parse_result.details.trip_length_days
+            updated = True
+        
+        elif field == "specific_month" and parse_result.details.specific_month:
+            state.travel_details.specific_month = parse_result.details.specific_month
+            updated = True
+        
+        elif field == "travel_dates":
+            # Handle both month and specific dates
+            if parse_result.details.specific_month:
+                state.travel_details.specific_month = parse_result.details.specific_month
+                updated = True
+            if parse_result.details.earliest_start_date:
+                state.travel_details.earliest_start_date = parse_result.details.earliest_start_date
+                updated = True
+            if parse_result.details.latest_start_date:
+                state.travel_details.latest_start_date = parse_result.details.latest_start_date
+                updated = True
+        
+        elif field == "budget" and parse_result.details.budget:
+            state.travel_details.budget = parse_result.details.budget
+            updated = True
+        
+        elif field == "travelers" and parse_result.details.travelers > 0:
+            state.travel_details.travelers = parse_result.details.travelers
+            updated = True
+        
+        # If parsing via the query parser didn't work, fall back to direct assignment for simple fields
+        if not updated:
+            if field == "destination":
+                state.travel_details.destination = value
+            elif field == "origin":
+                state.travel_details.origin = value
+            elif field == "specific_month":
+                # Simple cleanup for month names
+                months = ["january", "february", "march", "april", "may", "june", 
+                          "july", "august", "september", "october", "november", "december"]
+                cleaned_value = value.lower().strip()
+                for month in months:
+                    if month.startswith(cleaned_value) or month[:3] == cleaned_value.lower():
+                        state.travel_details.specific_month = month.capitalize()
+                        break
+            # Add fallbacks for other fields as needed
     
-    elif field == "budget":
-        try:
-            # Remove currency symbols and commas
-            cleaned_value = value.replace('$', '').replace(',', '').strip()
-            # Extract the number
-            import re
-            match = re.search(r'\d+', cleaned_value)
-            if match:
-                budget = float(match.group())
-                state.travel_details.budget = budget
-            else:
-                return f"Could not extract a budget amount from '{value}'."
-        except:
-            return f"Could not parse '{value}' as a budget amount."
-    
-    elif field == "travelers":
-        try:
-            # Handle conversational responses
-            value_lower = value.lower()
-            if "alone" in value_lower or "just me" in value_lower or "myself" in value_lower:
-                state.travel_details.travelers = 1
-            elif "couple" in value_lower or "two" in value_lower or "2" in value:
-                state.travel_details.travelers = 2
-            elif "family" in value_lower:
-                # Assume a typical family of 4 if not specified
-                state.travel_details.travelers = 4
-            else:
-                # Try to extract a number
-                import re
-                number_match = re.search(r'\d+', value)
-                if number_match:
-                    travelers = int(number_match.group())
-                    state.travel_details.travelers = travelers
-                else:
-                    return f"Could not determine the number of travelers from '{value}'."
-        except:
-            return f"Could not parse '{value}' as a number of travelers."
+    except Exception as e:
+        print(f"Error using query parser for update: {str(e)}")
+        # Fall back to basic parsing if query parser fails
+        if field == "destination":
+            state.travel_details.destination = value
+        elif field == "origin":
+            state.travel_details.origin = value
+        # Add other basic field assignments here
     
     # Update the state
     state.last_updated_field = field
@@ -362,6 +357,93 @@ async def process_message(user_message: str, session_id: Optional[str] = None) -
             # Set standard missing fields
             state.missing_info = ["destination", "trip_length_days", "travel_dates", "origin", "budget"]
             print(f"Error parsing initial query: {str(e)}")
+    else:
+        # This is a follow-up message, try to extract multiple pieces of information
+        try:
+            # Always run the query parser on follow-up messages to extract any information
+            parse_result = await parse_travel_query(user_message)
+            
+            # Update any fields that were extracted by the parser
+            updated_fields = []
+            
+            # Check and update destination
+            if parse_result.details.destination and (
+                not state.travel_details.destination or 
+                parse_result.details.destination != state.travel_details.destination
+            ):
+                state.travel_details.destination = parse_result.details.destination
+                if "destination" in state.missing_info:
+                    state.missing_info.remove("destination")
+                updated_fields.append("destination")
+            
+            # Check and update origin
+            if parse_result.details.origin and (
+                not state.travel_details.origin or 
+                parse_result.details.origin != state.travel_details.origin
+            ):
+                state.travel_details.origin = parse_result.details.origin
+                if "origin" in state.missing_info:
+                    state.missing_info.remove("origin")
+                updated_fields.append("origin")
+            
+            # Check and update trip length
+            if parse_result.details.trip_length_days and (
+                not state.travel_details.trip_length_days or 
+                parse_result.details.trip_length_days != state.travel_details.trip_length_days
+            ):
+                state.travel_details.trip_length_days = parse_result.details.trip_length_days
+                if "trip_length_days" in state.missing_info:
+                    state.missing_info.remove("trip_length_days")
+                updated_fields.append("trip length")
+            
+            # Check and update month/dates
+            date_fields_updated = False
+            
+            if parse_result.details.specific_month and (
+                not state.travel_details.specific_month or 
+                parse_result.details.specific_month != state.travel_details.specific_month
+            ):
+                state.travel_details.specific_month = parse_result.details.specific_month
+                date_fields_updated = True
+                updated_fields.append("month")
+            
+            if parse_result.details.earliest_start_date and (
+                not state.travel_details.earliest_start_date or 
+                parse_result.details.earliest_start_date != state.travel_details.earliest_start_date
+            ):
+                state.travel_details.earliest_start_date = parse_result.details.earliest_start_date
+                date_fields_updated = True
+                updated_fields.append("start date")
+            
+            if date_fields_updated and "travel_dates" in state.missing_info:
+                state.missing_info.remove("travel_dates")
+            
+            # Check and update budget
+            if parse_result.details.budget and (
+                not state.travel_details.budget or 
+                parse_result.details.budget != state.travel_details.budget
+            ):
+                state.travel_details.budget = parse_result.details.budget
+                if "budget" in state.missing_info:
+                    state.missing_info.remove("budget")
+                updated_fields.append("budget")
+            
+            # Check and update travelers
+            if parse_result.details.travelers > 1 and (
+                state.travel_details.travelers == 1 or 
+                parse_result.details.travelers != state.travel_details.travelers
+            ):
+                state.travel_details.travelers = parse_result.details.travelers
+                if "travelers" in state.missing_info:
+                    state.missing_info.remove("travelers")
+                updated_fields.append("number of travelers")
+            
+            if updated_fields:
+                print(f"Updated fields from follow-up message: {', '.join(updated_fields)}")
+        
+        except Exception as e:
+            print(f"Error extracting information from follow-up message: {str(e)}")
+            # If parsing fails, we'll rely on the chat agent to handle it
     
     # Update conversation history
     if not state.conversation_history:
@@ -381,6 +463,15 @@ async def process_message(user_message: str, session_id: Optional[str] = None) -
         "content": result.output,
         "timestamp": datetime.now().isoformat()
     })
+    
+    # If we have all the information, try to generate search queries
+    if not state.missing_info and not state.queries_generated:
+        try:
+            # Create the search queries
+            state.search_queries = create_flight_search_queries(state.travel_details)
+            state.queries_generated = True
+        except Exception as e:
+            print(f"Error generating search queries: {str(e)}")
     
     # Save the updated state
     SESSION_STORAGE[state.session_id] = state

@@ -101,7 +101,20 @@ response = requests.post(
     "http://localhost:8000/chat",
     json={
         "user_id": "user123",
-        "message": "I want a 3-day trip to Seattle in mid-June, budget $800."
+        "message": "I want a 3-day trip to Seattle in mid-June, budget $800.",
+        "session_id": None  # For first message in conversation
+    }
+)
+
+print(json.dumps(response.json(), indent=2))
+
+# Follow-up message in same conversation
+response = requests.post(
+    "http://localhost:8000/chat",
+    json={
+        "user_id": "user123",
+        "message": "I'd prefer to stay in Capitol Hill neighborhood",
+        "session_id": "session_id_from_previous_response"  # Use session_id returned from previous call
     }
 )
 
