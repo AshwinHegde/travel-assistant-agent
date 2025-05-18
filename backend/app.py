@@ -10,9 +10,17 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
+import uuid
+
+# AgentOps SDK for monitoring
+import agentops
 
 # Load environment variables
 load_dotenv()
+
+# Initialize AgentOps - this is all you need for basic integration
+AGENTOPS_API_KEY = os.environ.get("AGENTOPS_API_KEY", "")
+agentops.init(api_key=AGENTOPS_API_KEY)
 
 # Import only needed modules
 from orchestrator.travel_chat import process_message, ChatResponse
@@ -60,7 +68,11 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     user_id: Optional[str] = None
 
+# Use the operation decorator from AgentOps
+from agentops.sdk.decorators import operation
+
 @app.post("/chat", response_model=ChatResponse)
+@operation
 async def chat(request: ChatRequest):
     """
     Enhanced chat endpoint that uses the conversational agent to

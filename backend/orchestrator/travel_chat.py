@@ -14,6 +14,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, date
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+from agentops.sdk.decorators import operation, agent
 
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.openai import OpenAIModel
@@ -60,34 +61,44 @@ class ChatResponse(BaseModel):
 model = OpenAIModel('gpt-4o-mini', provider=OpenAIProvider(api_key=OPENAI_API_KEY))
 
 
-# Define the chat agent
-travel_chat_agent = Agent(
-    model,
-    deps_type=ConversationState,
-    instructions="""
-    You are a friendly travel assistant who helps users plan trips. Your goal is to collect all the information 
-    needed to search for travel options while keeping the conversation natural and engaging.
+# Define the chat agent class with agent decorator
+@agent
+class TravelChatAgent:
+    def __init__(self):
+        self.agent = Agent(
+            model,
+            deps_type=ConversationState,
+            instructions="""
+            You are a friendly travel assistant who helps users plan trips. Your goal is to collect all the information 
+            needed to search for travel options while keeping the conversation natural and engaging.
+            
+            When information is missing:
+            - Ask for ALL missing essential details in a single conversational message
+            - Frame your questions in a natural, friendly way that flows like a normal conversation
+            - Group related questions together (like dates and duration)
+            - Use what you already know about the user's preferences to personalize questions
+            - Offer reasonable suggestions or options when appropriate
+            - Be empathetic and understanding
+            
+            For example, instead of a checklist of questions, say something like:
+            "That sounds like a fun trip to New York! To help you find the best options, could you tell me when you're 
+            planning to travel and how long you'd like to stay? Also, are you traveling from your home in Seattle, and 
+            do you have a budget in mind for this trip?"
+            
+            Always maintain a friendly, helpful tone and keep responses concise while collecting all necessary information.
+            Once you have all the required information, let the user know you're ready to search for options.
+            """
+        )
     
-    When information is missing:
-    - Ask for ALL missing essential details in a single conversational message
-    - Frame your questions in a natural, friendly way that flows like a normal conversation
-    - Group related questions together (like dates and duration)
-    - Use what you already know about the user's preferences to personalize questions
-    - Offer reasonable suggestions or options when appropriate
-    - Be empathetic and understanding
-    
-    For example, instead of a checklist of questions, say something like:
-    "That sounds like a fun trip to New York! To help you find the best options, could you tell me when you're 
-    planning to travel and how long you'd like to stay? Also, are you traveling from your home in San Francisco, and 
-    do you have a budget in mind for this trip?"
-    
-    Always maintain a friendly, helpful tone and keep responses concise while collecting all necessary information.
-    Once you have all the required information, let the user know you're ready to search for options.
-    """
-)
+    async def run(self, message, deps):
+        return await self.agent.run(message, deps=deps)
+
+# Initialize the agent
+travel_chat_agent = TravelChatAgent().agent
 
 
 @travel_chat_agent.tool
+@operation
 async def get_conversation_context(ctx: RunContext[ConversationState]) -> str:
     """
     Get the current context of the conversation to help the model understand
@@ -147,6 +158,7 @@ async def get_conversation_context(ctx: RunContext[ConversationState]) -> str:
 
 
 @travel_chat_agent.tool
+@operation
 async def identify_missing_information(ctx: RunContext[ConversationState]) -> str:
     """
     Check what information is still missing from the travel query.
@@ -167,6 +179,7 @@ async def identify_missing_information(ctx: RunContext[ConversationState]) -> st
 
 
 @travel_chat_agent.tool
+@operation
 async def update_travel_details(
     ctx: RunContext[ConversationState], 
     field: str, 
@@ -277,6 +290,7 @@ async def update_travel_details(
 
 
 @travel_chat_agent.tool
+@operation
 async def generate_search_queries(ctx: RunContext[ConversationState]) -> str:
     """
     Generate flight search queries once we have all the necessary information.
@@ -314,6 +328,7 @@ async def generate_search_queries(ctx: RunContext[ConversationState]) -> str:
 # In a production app, this would be a database or Redis cache
 SESSION_STORAGE = {}
 
+@operation
 async def process_message(user_message: str, session_id: Optional[str] = None) -> ChatResponse:
     """
     Process a user message and update the conversation state.
